@@ -15,6 +15,14 @@ provider "aws" {
   region = var.aws_region
 }
 
+# Aliased provider required to manage the aws_wafv2_web_acl orphan in state.
+# WAF Web ACLs associated with CloudFront must be created in us-east-1;
+# this alias lets Terraform destroy the previously-created orphan cleanly.
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+}
+
 # ---------------------------------------------------------------------------
 # Variables
 # ---------------------------------------------------------------------------
