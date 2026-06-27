@@ -39,8 +39,8 @@ variable "public_key" {
 }
 
 variable "operator_cidr" {
-  type    = string
-  default = "0.0.0.0/0"
+  type        = string
+  default     = "0.0.0.0/0"
   description = "CIDR allowed SSH access for Ansible"
 }
 
@@ -82,10 +82,29 @@ data "aws_vpc" "default" {
   default = true
 }
 
+# Only AZs that are fully available (excludes us-east-1e and other AZs with
+# limited or no support for modern instance types like t3.small)
+data "aws_availability_zones" "available" {
+  state = "available"
+  filter {
+    name   = "opt-in-status"
+    values = ["opt-in-not-required"]
+  }
+}
+
 data "aws_subnets" "default" {
   filter {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
+  }
+  # Only consider default subnets in fully-available AZs
+  filter {
+    name   = "availabilityZone"
+    values = data.aws_availability_zones.available.names
+  }
+  filter {
+    name   = "default-for-az"
+    values = ["true"]
   }
 }
 
@@ -178,7 +197,9 @@ resource "aws_instance" "app" {
   key_name               = aws_key_pair.app.key_name
   iam_instance_profile   = aws_iam_instance_profile.ec2.name
   vpc_security_group_ids = [aws_security_group.ec2.id]
-  subnet_id              = tolist(data.aws_subnets.default.ids)[0]
+  # sort() gives a stable, deterministic first element from the filtered list
+  # of default subnets, all of which are in fully-available AZs (never -1e)
+  subnet_id              = sort(data.aws_subnets.default.ids)[0]
 
   root_block_device {
     volume_size           = 20
@@ -350,6 +371,11 @@ resource "aws_cloudtrail" "app" {
   include_global_service_events = true
   is_multi_region_trail         = true
   enable_log_file_validation    = true
+
+  # Ensure the bucket policy is applied before CloudTrail validates it;
+  # without this, both resources are created in parallel and CloudTrail
+  # sees an InsufficientS3BucketPolicyException.
+  depends_on = [aws_s3_bucket_policy.cloudtrail]
 
   tags = { Name = "${var.project_name}-trail" }
 }
