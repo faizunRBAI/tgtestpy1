@@ -1,0 +1,331 @@
+---
+- name: Configure EC2 instance and deploy FastAPI application
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/app
+    venv_dir: /opt/app/.venv
+    app_user: ubuntu
+    gunicorn_bin: /opt/app/.venv/bin/gunicorn
+    app_module: app.main:app
+    gunicorn_workers: 4
+    gunicorn_bind: "0.0.0.0:8000"
+    project_name: "{{ project_name | default('udap-app') }}"
+    aws_region: "{{ aws_region | default('us-east-1') }}"
+    cw_log_group: "{{ cw_log_group | default('/udap-app/app') }}"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # System packages
+    # -------------------------------------------------------------------------
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - python3.11
+          - python3.11-venv
+          - python3.11-dev
+          - python3-pip
+          - nginx
+          - git
+          - curl
+          - unzip
+          - wget
+          - software-properties-common
+        state: present
+
+    # -------------------------------------------------------------------------
+    # Application directory and source sync
+    # -------------------------------------------------------------------------
+    - name: Create application directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Synchronise application source to /opt/app
+      synchronize:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ app_dir }}/"
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=.github"
+          - "--exclude=terraform"
+          - "--exclude=ansible"
+          - "--exclude=__pycache__"
+          - "--exclude=*.pyc"
+          - "--exclude=.env"
+          - "--exclude=node_modules"
+        delete: false
+      become: false
+
+    - name: Fix ownership of application directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: true
+
+    # -------------------------------------------------------------------------
+    # Python virtual environment
+    # -------------------------------------------------------------------------
+    - name: Create Python 3.11 virtual environment at /opt/app/.venv
+      command: python3.11 -m venv {{ venv_dir }}
+      args:
+        creates: "{{ venv_dir }}/bin/activate"
+      become_user: "{{ app_user }}"
+
+    - name: Upgrade pip inside venv
+      command: "{{ venv_dir }}/bin/pip install --upgrade pip"
+      become_user: "{{ app_user }}"
+
+    - name: Install application dependencies from requirements.txt
+      command: "{{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt"
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: "{{ app_user }}"
+      when: (app_dir + '/requirements.txt') is file
+
+    - name: Install core dependencies if no requirements.txt
+      command: >
+        {{ venv_dir }}/bin/pip install
+        fastapi uvicorn[standard] gunicorn python-multipart
+      become_user: "{{ app_user }}"
+      when: not (app_dir + '/requirements.txt') is file
+
+    - name: Ensure gunicorn and uvicorn workers are always installed
+      command: >
+        {{ venv_dir }}/bin/pip install gunicorn uvicorn[standard]
+      become_user: "{{ app_user }}"
+
+    # -------------------------------------------------------------------------
+    # .env file (rendered via shell to tolerate empty values)
+    # -------------------------------------------------------------------------
+    - name: Render .env file
+      shell: |
+        cat > {{ app_dir }}/.env << 'ENVEOF'
+        APP_ENV=production
+        PORT=8000
+        HOST=0.0.0.0
+        ENVEOF
+      args:
+        executable: /bin/bash
+
+    - name: Fix .env ownership
+      file:
+        path: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0640"
+
+    # -------------------------------------------------------------------------
+    # Systemd service
+    # -------------------------------------------------------------------------
+    - name: Install systemd service unit for the FastAPI app
+      copy:
+        dest: /etc/systemd/system/fastapi-app.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=FastAPI Application (gunicorn + uvicorn)
+          After=network.target
+
+          [Service]
+          Type=exec
+          User={{ app_user }}
+          Group={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile=-{{ app_dir }}/.env
+          ExecStart={{ gunicorn_bin }} {{ app_module }} \
+                    -k uvicorn.workers.UvicornWorker \
+                    -w {{ gunicorn_workers }} \
+                    -b {{ gunicorn_bind }} \
+                    --access-logfile - \
+                    --error-logfile -
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=fastapi-app
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: true
+
+    - name: Enable and start FastAPI systemd service
+      systemd:
+        name: fastapi-app
+        enabled: true
+        state: restarted
+
+    # -------------------------------------------------------------------------
+    # Nginx reverse proxy
+    # -------------------------------------------------------------------------
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Install nginx site configuration
+      copy:
+        dest: /etc/nginx/sites-available/fastapi-app
+        mode: "0644"
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              server_name _;
+
+              access_log /var/log/nginx/fastapi-app.access.log;
+              error_log  /var/log/nginx/fastapi-app.error.log;
+
+              location / {
+                  proxy_pass         http://127.0.0.1:8000;
+                  proxy_http_version 1.1;
+                  proxy_set_header   Host              $host;
+                  proxy_set_header   X-Real-IP         $remote_addr;
+                  proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_set_header   Upgrade           $http_upgrade;
+                  proxy_set_header   Connection        "upgrade";
+                  proxy_read_timeout 300s;
+                  proxy_connect_timeout 75s;
+              }
+          }
+
+    - name: Enable nginx fastapi-app site
+      file:
+        src: /etc/nginx/sites-available/fastapi-app
+        dest: /etc/nginx/sites-enabled/fastapi-app
+        state: link
+
+    - name: Test nginx configuration
+      command: nginx -t
+      changed_when: false
+
+    - name: Restart nginx
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: true
+
+    # -------------------------------------------------------------------------
+    # CloudWatch Agent
+    # -------------------------------------------------------------------------
+    - name: Download CloudWatch Agent installer
+      get_url:
+        url: "https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb"
+        dest: /tmp/amazon-cloudwatch-agent.deb
+        mode: "0644"
+
+    - name: Install CloudWatch Agent
+      apt:
+        deb: /tmp/amazon-cloudwatch-agent.deb
+
+    - name: Create CloudWatch Agent configuration directory
+      file:
+        path: /opt/aws/amazon-cloudwatch-agent/etc
+        state: directory
+        mode: "0755"
+
+    - name: Write CloudWatch Agent configuration
+      shell: |
+        cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
+        {
+          "agent": {
+            "metrics_collection_interval": 60,
+            "run_as_user": "root"
+          },
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/log/nginx/fastapi-app.access.log",
+                    "log_group_name": "{{ cw_log_group }}",
+                    "log_stream_name": "{instance_id}/nginx-access",
+                    "retention_in_days": 30
+                  },
+                  {
+                    "file_path": "/var/log/nginx/fastapi-app.error.log",
+                    "log_group_name": "{{ cw_log_group }}",
+                    "log_stream_name": "{instance_id}/nginx-error",
+                    "retention_in_days": 30
+                  }
+                ]
+              }
+            }
+          },
+          "metrics": {
+            "aggregation_dimensions": [["InstanceId"]],
+            "append_dimensions": {
+              "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
+              "ImageId": "${aws:ImageId}",
+              "InstanceId": "${aws:InstanceId}",
+              "InstanceType": "${aws:InstanceType}"
+            },
+            "metrics_collected": {
+              "cpu": {
+                "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
+                "metrics_collection_interval": 60
+              },
+              "disk": {
+                "measurement": ["used_percent"],
+                "metrics_collection_interval": 60,
+                "resources": ["/"]
+              },
+              "mem": {
+                "measurement": ["mem_used_percent"],
+                "metrics_collection_interval": 60
+              }
+            }
+          }
+        }
+        CWEOF
+      args:
+        executable: /bin/bash
+
+    - name: Start and enable CloudWatch Agent
+      command: >
+        /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+        -a fetch-config
+        -m ec2
+        -s
+        -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+      register: cw_start_result
+      changed_when: cw_start_result.rc == 0
+
+    # -------------------------------------------------------------------------
+    # Final health check on the server itself
+    # -------------------------------------------------------------------------
+    - name: Wait for gunicorn to be listening on port 8000
+      wait_for:
+        host: "127.0.0.1"
+        port: 8000
+        timeout: 60
+        state: started
+
+    - name: Verify application responds to /health locally
+      uri:
+        url: "http://127.0.0.1:8000/health"
+        method: GET
+        status_code: [200, 201, 202, 204]
+        timeout: 30
+      retries: 5
+      delay: 10
+      register: health_result
+      until: health_result.status in [200, 201, 202, 204]
