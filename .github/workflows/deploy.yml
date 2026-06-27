@@ -1,0 +1,224 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # -------------------------------------------------------------------------
+  # TEST
+  # -------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi uvicorn gunicorn httpx pytest pytest-asyncio || true
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Lint (advisory only)
+        run: pip install flake8 && flake8 . --max-line-length=120 || true
+        continue-on-error: true
+
+      - name: Run tests
+        run: |
+          if [ -d tests ]; then
+            pytest tests/ -v
+          else
+            echo "No tests directory found, skipping."
+          fi
+
+  # -------------------------------------------------------------------------
+  # BUILD - provision infra with Terraform
+  # -------------------------------------------------------------------------
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      server_ip: ${{ steps.tf_outputs.outputs.server_ip }}
+      cloudfront_domain: ${{ steps.tf_outputs.outputs.cloudfront_domain }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      - name: Generate SSH key pair
+        run: |
+          ssh-keygen -t rsa -b 4096 -f /tmp/deploy_key -N ""
+          echo "SSH_PUBLIC_KEY=$(cat /tmp/deploy_key.pub)" >> $GITHUB_ENV
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="tf_state_bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -var="public_key=${SSH_PUBLIC_KEY}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Extract Terraform outputs
+        id: tf_outputs
+        working-directory: terraform
+        run: |
+          SERVER_IP=$(terraform output -raw instance_public_ip)
+          CF_DOMAIN=$(terraform output -raw cloudfront_domain)
+          echo "server_ip=${SERVER_IP}" >> $GITHUB_OUTPUT
+          echo "cloudfront_domain=${CF_DOMAIN}" >> $GITHUB_OUTPUT
+
+      - name: Save SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          cp /tmp/deploy_key ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Upload SSH key as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-ssh-key
+          path: /tmp/deploy_key
+          retention-days: 1
+
+      - name: Upload SSH public key as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-ssh-pubkey
+          path: /tmp/deploy_key.pub
+          retention-days: 1
+
+  # -------------------------------------------------------------------------
+  # DEPLOY - configure instance with Ansible, then smoke test
+  # -------------------------------------------------------------------------
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      SERVER_IP: ${{ needs.build.outputs.server_ip }}
+      CLOUDFRONT_DOMAIN: ${{ needs.build.outputs.cloudfront_domain }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download SSH private key
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-ssh-key
+          path: /tmp
+
+      - name: Fix SSH key permissions
+        run: chmod 600 /tmp/deploy_key
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ansible python3-boto3
+
+      - name: Wait for SSH to be available
+        run: |
+          echo "Waiting for SSH on ${SERVER_IP}..."
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/deploy_key ec2-user@${SERVER_IP} "echo ok" 2>/dev/null; then
+              echo "SSH is ready"
+              break
+            fi
+            echo "Attempt $i/30 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run Ansible playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook ansible/playbook.yml \
+            -i "${SERVER_IP}," \
+            --private-key /tmp/deploy_key \
+            -u ec2-user \
+            -e "project_name=${{ secrets.PROJECT_NAME }}" \
+            -e "aws_region=${{ secrets.AWS_REGION }}" \
+            -e "cloudwatch_log_group=/aws/ec2/${{ secrets.PROJECT_NAME }}/gunicorn"
+
+      - name: Wait for application to start
+        run: |
+          echo "Waiting for app to start on EC2 directly..."
+          for i in $(seq 1 12); do
+            STATUS=$(ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key ec2-user@${SERVER_IP} \
+              "curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/health" 2>/dev/null || echo "000")
+            if [ "${STATUS}" = "200" ]; then
+              echo "App is healthy (HTTP ${STATUS})"
+              break
+            fi
+            echo "Attempt $i/12: HTTP ${STATUS}, waiting 10s..."
+            sleep 10
+          done
+
+      - name: Smoke test - CloudFront endpoint
+        run: |
+          APP_URL="https://${CLOUDFRONT_DOMAIN}"
+          echo "Smoke testing ${APP_URL}/health"
+          for i in $(seq 1 20); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 30 \
+              --retry 3 \
+              "${APP_URL}/health" 2>/dev/null || echo "000")
+            echo "Attempt $i/20: HTTP ${HTTP_CODE}"
+            if echo "${HTTP_CODE}" | grep -qE '^[23]'; then
+              echo "Smoke test PASSED (HTTP ${HTTP_CODE})"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Smoke test FAILED - endpoint did not return 2xx/3xx"
+          exit 1
+
+      - name: Cleanup SSH key artifact
+        if: always()
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: deploy-ssh-key
+        continue-on-error: true
+
+      - name: Cleanup SSH pubkey artifact
+        if: always()
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: deploy-ssh-pubkey
+        continue-on-error: true
